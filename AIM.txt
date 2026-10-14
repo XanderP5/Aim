@@ -1,0 +1,545 @@
+--========================================================
+-- NEXUS PRO: DYNAMIC REAL-TIME TEAM TRACKER + AIM + ESP
+-- Roblox Studio / StarterPlayer > StarterPlayerScripts
+-- Keybinds:
+--   [G] เปิด/ปิด Aim Assist
+--   [H] เปิด/ปิด ESP
+--   [J] ซ่อน/แสดง วงกลม FOV
+--========================================================
+
+local Players = game:GetService("Players")
+local TeamsService = game:GetService("Teams")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+--========================================================
+-- CONFIGURATION
+--========================================================
+
+local Config = {
+    -- ระบบล็อกเป้า (Aim Assist)
+    AimAssist = true,          -- เปิดใช้งานดูดเป้าอัตโนมัติ (ไม่ต้องคลิก)
+    FOV = 40,                  -- ขนาดรัศมีวง FOV = 40
+    Smoothness = 18,           -- ความเร็วในการดูดเป้า (สมูทแบบจอย)
+    Prediction = 0.065,        -- คำนวณดักทางเวลาศัตรูวิ่ง
+    YOffset = 0,               -- ล็อกตรงหัวพอดี
+    WallCheck = true,          -- เช็กกำแพงบัง (ไม่ล็อกทะลุกำแพง)
+    TeamCheck = true,          -- เช็กทีมแบบ Real-Time ตลอดเวลา
+    TargetNPCs = false,        -- ล็อกเฉพาะผู้เล่น
+    MaxDistance = 500,         -- ระยะล็อกสูงสุด (Studs)
+
+    -- ระบบแสดงผล (Visuals & ESP)
+    ShowFOV = true,            -- แสดงวงกลม FOV บนหน้าจอ
+    FOVColor = Color3.fromRGB(255, 45, 45),        -- สีวง FOV ปกติ (สีแดง)
+    FOVLockedColor = Color3.fromRGB(50, 255, 100), -- สีวง FOV เมื่อล็อกเป้าติด (สีเขียว)
+    ESP = true,                -- เปิดระบบมองทะลุเฉพาะศัตรู
+    ESPColor = Color3.fromRGB(255, 40, 50)         -- สีกรอบศัตรู (สีแดง)
+}
+
+--========================================================
+-- UI & FOV CIRCLE SETUP
+--========================================================
+
+local OldGui = PlayerGui:FindFirstChild("NexusProUI")
+if OldGui then OldGui:Destroy() end
+
+local Gui = Instance.new("ScreenGui")
+Gui.Name = "NexusProUI"
+Gui.ResetOnSpawn = false
+Gui.IgnoreGuiInset = true
+Gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+Gui.Parent = PlayerGui
+
+local FOVCircle = Instance.new("Frame")
+FOVCircle.Name = "FOVRing"
+FOVCircle.AnchorPoint = Vector2.new(0.5, 0.5)
+FOVCircle.BackgroundTransparency = 1
+FOVCircle.Size = UDim2.fromOffset(Config.FOV * 2, Config.FOV * 2)
+FOVCircle.Parent = Gui
+
+Instance.new("UICorner", FOVCircle).CornerRadius = UDim.new(1, 0)
+
+local FOVStroke = Instance.new("UIStroke")
+FOVStroke.Color = Config.FOVColor
+FOVStroke.Thickness = 1.8
+FOVStroke.Transparency = 0.15
+FOVStroke.Parent = FOVCircle
+
+local StatusLabel = Instance.new("TextLabel")
+StatusLabel.AnchorPoint = Vector2.new(0.5, 0)
+StatusLabel.Position = UDim2.new(0.5, 0, 0, 12)
+StatusLabel.Size = UDim2.fromOffset(440, 26)
+StatusLabel.BackgroundTransparency = 0.35
+StatusLabel.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+StatusLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+StatusLabel.Font = Enum.Font.GothamBold
+StatusLabel.TextSize = 13
+StatusLabel.Parent = Gui
+Instance.new("UICorner", StatusLabel).CornerRadius = UDim.new(0, 6)
+
+--========================================================
+-- DYNAMIC REAL-TIME TEAM IDENTIFIER (ตัวระบุทีมอัจฉริยะ)
+--========================================================
+
+-- ฟังก์ชันดึง "รหัสทีมปัจจุบัน" ของผู้เล่นแบบสดๆ (รองรับทุกระบบเกม)
+local function GetPlayerDynamicTeam(player)
+    if not player then return nil end
+
+    -- 1. เช็กจากระบบ Team มาตรฐานของ Roblox
+    if player.Team ~= nil then
+        return "TEAM_INST_" .. player.Team.Name
+    end
+
+    -- 2. เช็กจาก TeamColor (กรณีเกมเปลี่ยนแค่สีทีมแต่ไม่ได้สร้าง Object Team)
+    if not player.Neutral and player.TeamColor then
+        return "TEAM_COLOR_" .. tostring(player.TeamColor)
+    end
+
+    -- 3. เช็กจาก Attribute บนตัว Player หรือ Character (เกมยุคใหม่นิยมใช้)
+    local char = player.Character
+    local attrNames = {"Team", "TeamName", "TeamId", "Faction", "Side", "Role"}
+    for _, name in ipairs(attrNames) do
+        local val = player:GetAttribute(name) or (char and char:GetAttribute(name))
+        if val ~= nil and tostring(val) ~= "" then
+            return "ATTR_" .. name .. "_" .. tostring(val)
+        end
+    end
+
+    -- 4. เช็กจาก Value Object ใน Player หรือ leaderstats หรือ Character
+    local containers = {player, player:FindFirstChild("leaderstats"), char}
+    for _, container in ipairs(containers) do
+        if container then
+            for _, name in ipairs(attrNames) do
+                local valObj = container:FindFirstChild(name)
+                if valObj and valObj:IsA("ValueBase") and valObj.Value ~= nil and tostring(valObj.Value) ~= "" then
+                    return "VAL_" .. name .. "_" .. tostring(valObj.Value)
+                end
+            end
+        end
+    end
+
+    -- 5. เช็กจาก Folder ที่เก็บ Character ใน Workspace (บางเกมย้ายตัวละครเข้า Folder ทีมเมื่อเปลี่ยนฝั่ง)
+    if char and char.Parent and char.Parent ~= workspace then
+        return "FOLDER_" .. char.Parent:GetFullName()
+    end
+
+    -- 6. เช็กจาก BrickColor ของ Torso/UpperTorso (กรณีเกมแบ่งทีมด้วยการย้อมสีเสื้อ/สีตัว)
+    if char then
+        local torso = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
+        if torso and torso:IsA("BasePart") then
+            -- ใช้เฉพาะกรณีที่มี Teams อยู่ในเกมแต่ไม่ได้ผูกกับ Player โดยตรง
+            if #TeamsService:GetTeams() > 0 then
+                return "TORSO_COLOR_" .. tostring(torso.BrickColor)
+            end
+        end
+    end
+
+    return nil -- ไม่มีทีม (Free For All)
+end
+
+local function UpdateStatusUI()
+    local myTeam = GetPlayerDynamicTeam(LocalPlayer)
+    local cleanTeamName = "None (FFA)"
+    if LocalPlayer.Team then
+        cleanTeamName = LocalPlayer.Team.Name
+    elseif myTeam then
+        cleanTeamName = string.gsub(myTeam, "^%u+_", "")
+    end
+
+    StatusLabel.Text = string.format(
+        "My Team: [%s] | [G] Aim: %s | [H] ESP: %s | [J] FOV: %s",
+        cleanTeamName,
+        Config.AimAssist and "ON" or "OFF",
+        Config.ESP and "ON" or "OFF",
+        Config.ShowFOV and "ON" or "OFF"
+    )
+end
+
+-- เช็กแบบสดๆ ว่าผู้เล่นคนนี้เป็นเพื่อนร่วมทีมกับเราในวินาทีนี้หรือไม่
+local function IsTeammateNow(player)
+    if not player then return false end
+    if player == LocalPlayer then return true end
+    if not Config.TeamCheck then return false end
+
+    local myTeamKey = GetPlayerDynamicTeam(LocalPlayer)
+    local theirTeamKey = GetPlayerDynamicTeam(player)
+
+    -- ถ้าระบุรหัสทีมได้ทั้งคู่ และรหัสตรงกัน = อยู่ทีมเดียวกัน!
+    if myTeamKey ~= nil and theirTeamKey ~= nil then
+        if myTeamKey == theirTeamKey then
+            return true
+        else
+            return false
+        end
+    end
+
+    -- เช็กสำรองชั้นสุดท้าย: เทียบ Team และ TeamColor ตรงๆ
+    if LocalPlayer.Team and player.Team and LocalPlayer.Team == player.Team then
+        return true
+    end
+    if not LocalPlayer.Neutral and not player.Neutral and LocalPlayer.TeamColor == player.TeamColor then
+        return true
+    end
+
+    return false
+end
+
+local function IsValidEnemyCharacter(character)
+    if not character or character == LocalPlayer.Character then return false end
+
+    local player = Players:GetPlayerFromCharacter(character)
+    if player then
+        return not IsTeammateNow(player)
+    end
+
+    return Config.TargetNPCs
+end
+
+local function GetAllEnemyCharacters()
+    local enemies = {}
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character and not IsTeammateNow(player) then
+            table.insert(enemies, player.Character)
+        end
+    end
+
+    if Config.TargetNPCs then
+        for _, obj in ipairs(workspace:GetChildren()) do
+            if obj:IsA("Model") and obj ~= LocalPlayer.Character then
+                if Players:GetPlayerFromCharacter(obj) == nil then
+                    local hum = obj:FindFirstChildOfClass("Humanoid")
+                    if hum and hum.Health > 0 then
+                        table.insert(enemies, obj)
+                    end
+                end
+            end
+        end
+    end
+
+    return enemies
+end
+
+local function GetAimPart(character)
+    if not character then return nil end
+    return character:FindFirstChild("Head")
+        or character:FindFirstChild("UpperTorso")
+        or character:FindFirstChild("Torso")
+        or character:FindFirstChild("HumanoidRootPart")
+end
+
+--========================================================
+-- SMART WALLCHECK
+--========================================================
+
+local function IsVisible(targetPart, targetCharacter)
+    if not Config.WallCheck then return true end
+    local Camera = workspace.CurrentCamera
+    if not Camera or not targetPart then return false end
+
+    local origin = Camera.CFrame.Position
+    local direction = targetPart.Position - origin
+
+    local ignoreList = {Camera}
+    if LocalPlayer.Character then
+        table.insert(ignoreList, LocalPlayer.Character)
+    end
+
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.IgnoreWater = true
+
+    for _ = 1, 5 do
+        rayParams.FilterDescendantsInstances = ignoreList
+        local result = workspace:Raycast(origin, direction, rayParams)
+
+        if not result then
+            return true
+        end
+
+        local hit = result.Instance
+        if hit:IsDescendantOf(targetCharacter) then
+            return true
+        end
+
+        if hit.Transparency >= 0.95 or not hit.CanCollide or hit:FindFirstAncestorOfClass("Accessory") then
+            table.insert(ignoreList, hit)
+        else
+            return false
+        end
+    end
+
+    return false
+end
+
+--========================================================
+-- AIM POINT & TARGET SEARCH
+--========================================================
+
+local function GetAimReferencePoint(Camera)
+    if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then
+        return Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    else
+        return UserInputService:GetMouseLocation()
+    end
+end
+
+local function FindBestTarget(Camera, aimPoint)
+    local bestPart = nil
+    local shortestDist = Config.FOV
+
+    for _, character in ipairs(GetAllEnemyCharacters()) do
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        local forceField = character:FindFirstChildOfClass("ForceField")
+        local aimPart = GetAimPart(character)
+
+        if humanoid and humanoid.Health > 0 and not forceField and aimPart then
+            local worldDist = (aimPart.Position - Camera.CFrame.Position).Magnitude
+            if worldDist <= Config.MaxDistance then
+                local screenPos, onScreen = Camera:WorldToViewportPoint(aimPart.Position)
+
+                if onScreen and screenPos.Z > 0 then
+                    local screenDist = (Vector2.new(screenPos.X, screenPos.Y) - aimPoint).Magnitude
+
+                    if screenDist <= Config.FOV and screenDist < shortestDist then
+                        if IsVisible(aimPart, character) then
+                            shortestDist = screenDist
+                            bestPart = aimPart
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return bestPart
+end
+
+--========================================================
+-- ESP SYSTEM & INSTANT TEAM-CHANGE CLEANUP
+--========================================================
+
+local ESPFolder = workspace:FindFirstChild("NexusProESP")
+if ESPFolder then ESPFolder:Destroy() end
+
+ESPFolder = Instance.new("Folder")
+ESPFolder.Name = "NexusProESP"
+ESPFolder.Parent = workspace
+
+local ESPCache = {}
+local CurrentTarget = nil
+
+local function ClearESP(character)
+    if ESPCache[character] then
+        if ESPCache[character].Highlight then ESPCache[character].Highlight:Destroy() end
+        if ESPCache[character].Billboard then ESPCache[character].Billboard:Destroy() end
+        ESPCache[character] = nil
+    end
+end
+
+local function ClearAllESP()
+    for character, _ in pairs(ESPCache) do
+        ClearESP(character)
+    end
+end
+
+-- ดักจับ Event เมื่อเราหรือผู้เล่นคนอื่นเปลี่ยนทีม ให้รีเซ็ตเป้าและ ESP ทันที
+local function HookPlayerTeamChanges(player)
+    player:GetPropertyChangedSignal("Team"):Connect(function()
+        CurrentTarget = nil
+        if player == LocalPlayer then
+            ClearAllESP()
+        elseif player.Character then
+            ClearESP(player.Character)
+        end
+        UpdateStatusUI()
+    end)
+
+    player:GetPropertyChangedSignal("TeamColor"):Connect(function()
+        CurrentTarget = nil
+        if player == LocalPlayer then
+            ClearAllESP()
+        elseif player.Character then
+            ClearESP(player.Character)
+        end
+        UpdateStatusUI()
+    end)
+
+    player.AttributeChanged:Connect(function()
+        CurrentTarget = nil
+        if player == LocalPlayer then
+            ClearAllESP()
+        elseif player.Character then
+            ClearESP(player.Character)
+        end
+        UpdateStatusUI()
+    end)
+end
+
+for _, player in ipairs(Players:GetPlayers()) do
+    HookPlayerTeamChanges(player)
+end
+Players.PlayerAdded:Connect(HookPlayerTeamChanges)
+
+--========================================================
+-- CORE CAMERA LOCK (RENDER PRIORITY OVERRIDE)
+--========================================================
+
+pcall(function()
+    RunService:UnbindFromRenderStep("NexusProAimAssist")
+end)
+
+RunService:BindToRenderStep("NexusProAimAssist", Enum.RenderPriority.Camera.Value + 1, function(dt)
+    local Camera = workspace.CurrentCamera
+    if not Camera then return end
+
+    local aimPoint = GetAimReferencePoint(Camera)
+
+    FOVCircle.Position = UDim2.fromOffset(aimPoint.X, aimPoint.Y)
+    FOVCircle.Size = UDim2.fromOffset(Config.FOV * 2, Config.FOV * 2)
+    FOVCircle.Visible = Config.AimAssist and Config.ShowFOV
+
+    if not Config.AimAssist then
+        CurrentTarget = nil
+        FOVStroke.Color = Config.FOVColor
+        return
+    end
+
+    -- เช็กซ้ำทุกเฟรมว่าเป้าหมายเดิมยังเป็นศัตรูอยู่ไหม (ถ้าเพิ่งเปลี่ยนมาทีมเรา จะหลุดล็อกทันทีในเฟรมนั้นเลย)
+    if CurrentTarget then
+        local character = CurrentTarget.Parent
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local valid = false
+
+        if character and IsValidEnemyCharacter(character) and humanoid and humanoid.Health > 0 then
+            local worldDist = (CurrentTarget.Position - Camera.CFrame.Position).Magnitude
+            local screenPos, onScreen = Camera:WorldToViewportPoint(CurrentTarget.Position)
+
+            if onScreen and screenPos.Z > 0 and worldDist <= Config.MaxDistance then
+                local screenDist = (Vector2.new(screenPos.X, screenPos.Y) - aimPoint).Magnitude
+                if screenDist <= Config.FOV and IsVisible(CurrentTarget, character) then
+                    valid = true
+                end
+            end
+        end
+
+        if not valid then
+            CurrentTarget = nil
+        end
+    end
+
+    if not CurrentTarget then
+        CurrentTarget = FindBestTarget(Camera, aimPoint)
+    end
+
+    if CurrentTarget then
+        FOVStroke.Color = Config.FOVLockedColor
+
+        local velocity = CurrentTarget.AssemblyLinearVelocity or Vector3.zero
+        local predictedPos = CurrentTarget.Position + (velocity * Config.Prediction) + Vector3.new(0, Config.YOffset, 0)
+
+        local targetCFrame = CFrame.lookAt(Camera.CFrame.Position, predictedPos)
+
+        local alpha = 1 - math.exp(-Config.Smoothness * dt)
+        Camera.CFrame = Camera.CFrame:Lerp(targetCFrame, math.clamp(alpha, 0, 1))
+    else
+        FOVStroke.Color = Config.FOVColor
+    end
+end)
+
+--========================================================
+-- REAL-TIME ESP LOOP
+--========================================================
+
+RunService.Heartbeat:Connect(function()
+    local Camera = workspace.CurrentCamera
+    if not Camera then return end
+
+    UpdateStatusUI()
+    local activeEnemies = {}
+
+    if Config.ESP then
+        for _, character in ipairs(GetAllEnemyCharacters()) do
+            local humanoid = character:FindFirstChildOfClass("Humanoid")
+            local head = GetAimPart(character)
+
+            if humanoid and humanoid.Health > 0 and head then
+                activeEnemies[character] = true
+
+                if not ESPCache[character] then
+                    local highlight = Instance.new("Highlight")
+                    highlight.Name = "NexusHighlight"
+                    highlight.Adornee = character
+                    highlight.FillColor = Config.ESPColor
+                    highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+                    highlight.FillTransparency = 0.55
+                    highlight.OutlineTransparency = 0
+                    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                    highlight.Parent = ESPFolder
+
+                    local billboard = Instance.new("BillboardGui")
+                    billboard.Name = "NexusTag"
+                    billboard.Adornee = head
+                    billboard.Size = UDim2.fromOffset(140, 36)
+                    billboard.StudsOffset = Vector3.new(0, 2.5, 0)
+                    billboard.AlwaysOnTop = true
+                    billboard.Parent = ESPFolder
+
+                    local infoText = Instance.new("TextLabel")
+                    infoText.Name = "Info"
+                    infoText.Size = UDim2.fromScale(1, 1)
+                    infoText.BackgroundTransparency = 1
+                    infoText.TextColor3 = Color3.fromRGB(255, 80, 80)
+                    infoText.TextStrokeTransparency = 0.2
+                    infoText.Font = Enum.Font.GothamBold
+                    infoText.TextSize = 12
+                    infoText.Parent = billboard
+
+                    ESPCache[character] = {
+                        Highlight = highlight,
+                        Billboard = billboard,
+                        Label = infoText
+                    }
+                end
+
+                local entry = ESPCache[character]
+                local dist = math.floor((head.Position - Camera.CFrame.Position).Magnitude)
+                local hp = math.floor(humanoid.Health)
+                entry.Label.Text = string.format("%s\n[HP: %d | %dm]", character.Name, hp, dist)
+            end
+        end
+    end
+
+    -- ลบ ESP ของคนที่เพิ่งย้ายมาทีมเดียวกับเราออกทันที
+    for character, _ in pairs(ESPCache) do
+        if not activeEnemies[character] or not character.Parent or not IsValidEnemyCharacter(character) then
+            ClearESP(character)
+        end
+    end
+end)
+
+--========================================================
+-- KEYBINDS (G = AIM, H = ESP, J = HIDE FOV)
+--========================================================
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if UserInputService:GetFocusedTextBox() then return end
+
+    if input.KeyCode == Enum.KeyCode.G then
+        Config.AimAssist = not Config.AimAssist
+        UpdateStatusUI()
+    elseif input.KeyCode == Enum.KeyCode.H then
+        Config.ESP = not Config.ESP
+        UpdateStatusUI()
+    elseif input.KeyCode == Enum.KeyCode.J then
+        Config.ShowFOV = not Config.ShowFOV
+        StatusLabel.Visible = Config.ShowFOV
+        UpdateStatusUI()
+    end
+end)
+
+UpdateStatusUI()
+print("[NEXUS PRO] Real-Time Dynamic Team Tracker Loaded!")
